@@ -12,7 +12,9 @@ SED_IN_PLACE_ARG = "-i ''" if IS_MAC else "-i"
 FILES_TO_COPY = {
     "eddy-ng/sensor_ldc1612_ng.c": "src",
     "probe_eddy_ng.py": "klippy/extras",
-    "ldc1612_ng.py": "klippy/extras"
+    "ldc1612_ng.py": "klippy/extras",
+    "probe_eddy_ng_temp_profiles.py": "klippy/extras"
+
 }
 
 

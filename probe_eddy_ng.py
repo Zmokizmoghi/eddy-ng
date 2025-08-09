@@ -58,6 +58,8 @@ except ImportError:
     IS_KALICO = False
 
 from . import ldc1612_ng
+# Load temp profiles
+from . import probe_eddy_ng_temp_profiles
 
 try:
     import plotly  # noqa
@@ -68,6 +70,7 @@ try:
     import scipy  # noqa
 except ImportError:
     scipy = None
+
 
 # In this file, a couple of conventions are used (for sanity).
 # Variables are named according to:
@@ -538,6 +541,10 @@ class ProbeEddy:
         # patch bed_mesh because Klipper
         if not IS_KALICO:
             bed_mesh.ProbeManager.start_probe = bed_mesh_ProbeManager_start_probe_override
+
+        # Temp Patch Starts
+        probe_eddy_ng_temp_profiles.add_temperature_profiles(self)
+        # Temp Patch Ends
 
     def _log_error(self, msg):
         logging.error(f"{self._name}: {msg}")
