@@ -543,7 +543,7 @@ class ProbeEddy:
             bed_mesh.ProbeManager.start_probe = bed_mesh_ProbeManager_start_probe_override
 
         # Temp Patch Starts
-        probe_eddy_ng_temp_profiles.add_temperature_profiles(self)
+        probe_eddy_ng_temp_profiles.add_temperature_profiles(config, self)
         # Temp Patch Ends
 
     def _log_error(self, msg):

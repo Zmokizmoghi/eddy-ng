@@ -2,48 +2,56 @@
 """
 Temperature Profile Extension for probe_eddy_ng.py
 Adds temperature profile support for BTT Eddy
-Version: 1.0.0
+Version: 2.0.2
 """
 
-import json
 import logging
+
+try:
+    from klippy.configfile import ConfigWrapper
+
+    IS_KALICO = True
+except ImportError:
+    from configfile import ConfigWrapper
+
+    IS_KALICO = False
 
 class EddyTemperatureProfiles:
     """
     Temperature profile manager for BTT Eddy
-    Uses JSON to store profiles in printer.cfg
+    Stores profiles as separate config sections in printer.cfg
     """
 
-    def __init__(self, probe_eddy):
+    def __init__(self, config: ConfigWrapper, probe_eddy):
         self.probe = probe_eddy
-        self.printer = probe_eddy._printer
-        self.gcode = probe_eddy._gcode
+        self.printer = config.get_printer()
+        self.gcode = self.printer.lookup_object('gcode')
         self.name = probe_eddy._full_name
+        self.config = config
 
         # Initialize logger first
         self.logger = logging.getLogger(__name__)
 
         # Get BTT Eddy temperature sensor object
         self.temperature_sensor = None
-        self._init_temperature_sensor()
+        self.printer.register_event_handler("klippy:ready", self._init_temperature_sensor)
 
         # Profiles and settings
         self.profiles = {}
         self.active_profile = None
         self.auto_switch_enabled = False
-        self.temperature_tolerance = 2.0  # Temperature tolerance in degrees
+        self.temperature_tolerance = 2.0
 
-        # Load saved profiles
+        # Load profiles from config
         self._load_profiles()
 
         # Register commands
-        self._register_commands()
+        self.printer.register_event_handler("klippy:ready", self._register_commands)
 
     def _init_temperature_sensor(self):
         """Initialize access to BTT Eddy temperature sensor"""
         try:
             # In your config: [temperature_sensor btt_eddy]
-            # Probe name: probe_eddy_ng btt_eddy -> take last word
             sensor_name = f"temperature_sensor {self.name.split()[-1]}"
             self.temperature_sensor = self.printer.lookup_object(sensor_name)
             self.logger.info(f"Found temperature sensor: {sensor_name}")
@@ -54,7 +62,6 @@ class EddyTemperatureProfiles:
                 self.logger.info("Found temperature sensor: temperature_sensor btt_eddy")
             except:
                 try:
-                    # Try eddy MCU temperature as fallback
                     self.temperature_sensor = self.printer.lookup_object("temperature_sensor btt_eddy_mcu")
                     self.logger.info("Using MCU temperature as fallback: temperature_sensor btt_eddy_mcu")
                 except:
@@ -64,7 +71,6 @@ class EddyTemperatureProfiles:
         """Get current BTT Eddy sensor temperature"""
         if self.temperature_sensor:
             try:
-                # Get sensor status
                 reactor = self.printer.get_reactor()
                 eventtime = reactor.monotonic()
                 status = self.temperature_sensor.get_status(eventtime)
@@ -81,80 +87,115 @@ class EddyTemperatureProfiles:
         except:
             pass
 
-        # If nothing works, return room temperature
         return 25.0
 
     def _load_profiles(self):
-        """Load profiles from configuration"""
-        try:
-            # Get configfile object
-            config = self.printer.lookup_object('configfile')
+        """Load profiles from configuration sections"""
+        # Load main settings from probe section
+        self.auto_switch_enabled = self.config.getboolean('temp_profiles_auto_switch', False)
+        self.active_profile = self.config.get('temp_profiles_active', None)
+        self.temperature_tolerance = self.config.getfloat('temp_profiles_tolerance', 2.0)
 
-            # Get configuration sections
-            sections = config.get_status(None)
+        # Load profile sections - use config object directly
+        all_config = self.config.get_printer().lookup_object('configfile')
 
-            # Look for our section in saved configuration
-            section_name = self.name
+        # Get all section names from the main config
+        for section_name in self.config.get_prefix_sections('eddy_temp_profile '):
+            # Extract profile name from section name
+            profile_name = section_name.get_name().split('eddy_temp_profile ')[1]
+            # self.logger.info(f"Section name from `section_name`: {section_name.get_name()}")
 
-            # Check save_config_pending
-            if 'save_config_pending_items' in sections:
-                saved_config = sections['save_config_pending_items']
-                if section_name in saved_config:
-                    section = saved_config[section_name]
-                    # Load JSON profiles
-                    profiles_json = section.get('temperature_profiles', '{}')
-                    if profiles_json:
-                        try:
-                            self.profiles = json.loads(profiles_json)
-                            self.logger.info(f"Loaded {len(self.profiles)} temperature profiles from saved config")
-                        except json.JSONDecodeError as e:
-                            self.logger.error(f"Failed to parse temperature profiles: {e}")
-                            self.profiles = {}
+            # # Get the section config
+            # section = self.config.getsection(section_name)
+            # self.logger.info(f"Section: {section}")
+            # self.logger.info(f"Section name: {section.get_name()}")
 
-                    # Load settings
-                    self.auto_switch_enabled = section.get('temp_profiles_auto_switch', 'False') == 'True'
-                    self.active_profile = section.get('temp_profiles_active', None)
-                    self.temperature_tolerance = float(section.get('temp_profiles_tolerance', '2.0'))
-                    return
+            section = section_name
 
-            # If not found in saved config, try regular config
-            if hasattr(config, 'config') and section_name in config.config:
-                section = config.config[section_name]
-                profiles_json = section.get('temperature_profiles', '{}')
-                if profiles_json:
-                    try:
-                        self.profiles = json.loads(profiles_json)
-                        self.logger.info(f"Loaded {len(self.profiles)} temperature profiles")
-                    except:
-                        self.profiles = {}
+            profile = {
+                'temp_min': section.getfloat('temp_min'),
+                'temp_max': section.getfloat('temp_max'),
+                'tap_adjust_z': section.getfloat('tap_adjust_z', 0.0),
+                'reg_drive_current': section.getint('reg_drive_current', 15),
+                'tap_drive_current': section.getint('tap_drive_current', 16),
+                'calibration_version': section.getint('calibration_version', 5),
+                'calibrated_at_temp': section.getfloat('calibrated_at_temp', None),
+            }
 
-                self.auto_switch_enabled = section.getboolean('temp_profiles_auto_switch', False)
-                self.active_profile = section.get('temp_profiles_active', None)
-                self.temperature_tolerance = section.getfloat('temp_profiles_tolerance', 2.0)
-            else:
-                self.logger.info("No saved profiles found")
-        except Exception as e:
-            self.logger.error(f"Error loading profiles: {e}")
-            self.profiles = {}
+            # Load calibrated_drive_currents
+            dc_str = section.get('calibrated_drive_currents', None)
+            if dc_str:
+                profile['calibrated_drive_currents'] = dc_str
 
-    def _save_profiles(self):
-        """Save profiles to configuration"""
+            # Load calibration data fields
+            calibrations = {}
+            # Get all options in the section
+            for option in section.get_prefix_options('calibration_'):
+                if not option.endswith('_version'):
+                    calibrations[option] = section.get(option)
+
+            if calibrations:
+                profile['calibrations'] = calibrations
+
+            self.profiles[profile_name] = profile
+
+        if self.profiles:
+            self.logger.info(f"Loaded {len(self.profiles)} temperature profiles from config")
+
+    def _save_profile_to_config(self, profile_name):
+        """Save a single profile to configuration"""
+        if profile_name not in self.profiles:
+            return False
+
+        profile = self.profiles[profile_name]
         configfile = self.printer.lookup_object('configfile')
 
-        # Save JSON profiles
-        profiles_json = json.dumps(self.profiles, indent=2)
-        configfile.set(self.name, 'temperature_profiles', profiles_json)
+        section_name = f'eddy_temp_profile {profile_name}'
 
-        # Save settings
+        # Save basic profile settings
+        configfile.set(section_name, 'temp_min', '%.2f' % profile['temp_min'])
+        configfile.set(section_name, 'temp_max', '%.2f' % profile['temp_max'])
+        configfile.set(section_name, 'tap_adjust_z', '%.6f' % profile.get('tap_adjust_z', 0.0))
+        configfile.set(section_name, 'reg_drive_current', str(profile.get('reg_drive_current', 15)))
+        configfile.set(section_name, 'tap_drive_current', str(profile.get('tap_drive_current', 16)))
+        configfile.set(section_name, 'calibration_version', str(profile.get('calibration_version', 5)))
+
+        if profile.get('calibrated_at_temp') is not None:
+            configfile.set(section_name, 'calibrated_at_temp', '%.2f' % profile['calibrated_at_temp'])
+
+        # Save calibrated_drive_currents
+        if 'calibrated_drive_currents' in profile:
+            configfile.set(section_name, 'calibrated_drive_currents', profile['calibrated_drive_currents'])
+
+        # Save calibration data
+        if 'calibrations' in profile:
+            for cal_key, cal_data in profile['calibrations'].items():
+                configfile.set(section_name, cal_key, cal_data)
+
+        return True
+
+    def _save_settings(self):
+        """Save global settings to configuration"""
+        configfile = self.printer.lookup_object('configfile')
+
+        # Save global settings to main probe section
         configfile.set(self.name, 'temp_profiles_auto_switch', str(self.auto_switch_enabled))
         if self.active_profile:
             configfile.set(self.name, 'temp_profiles_active', self.active_profile)
-        configfile.set(self.name, 'temp_profiles_tolerance', str(self.temperature_tolerance))
+        configfile.set(self.name, 'temp_profiles_tolerance', '%.1f' % self.temperature_tolerance)
 
-        self.gcode.respond_info("Temperature profiles saved. Run SAVE_CONFIG to persist changes.")
+    def _delete_profile_from_config(self, profile_name):
+        """Remove a profile section from configuration"""
+        configfile = self.printer.lookup_object('configfile')
+        section_name = f'eddy_temp_profile {profile_name}'
+
+        # Mark section for deletion by setting a special marker
+        # Klipper will remove the section when SAVE_CONFIG is run
+        configfile.remove_section(section_name)
 
     def _register_commands(self):
         """Register G-code commands"""
+        self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_command(
             'EDDY_TEMP_PROFILE',
             self.cmd_EDDY_TEMP_PROFILE,
@@ -205,7 +246,6 @@ class EddyTemperatureProfiles:
 
         # Apply drive currents
         if 'calibrated_drive_currents' in profile and hasattr(self.probe, '_calibrated_drive_currents'):
-            # Parse drive currents string
             dc_str = profile['calibrated_drive_currents']
             if ',' in dc_str:
                 self.probe._calibrated_drive_currents = [int(x.strip()) for x in dc_str.split(',')]
@@ -285,7 +325,10 @@ class EddyTemperatureProfiles:
         # Save current temperature
         profile['calibrated_at_temp'] = self.get_current_temperature()
 
-        self._save_profiles()
+        # Save profile to config
+        self._save_profile_to_config(profile_name)
+        self._save_settings()
+
         self.logger.info(f"Saved calibration to profile '{profile_name}'")
         return True
 
@@ -329,9 +372,11 @@ class EddyTemperatureProfiles:
             if profile['temp_min'] <= current_temp <= profile['temp_max']:
                 status.append("IN RANGE")
 
-            calibrated_temp = profile.get('calibrated_at_temp', 'N/A')
-            if calibrated_temp != 'N/A':
+            calibrated_temp = profile.get('calibrated_at_temp')
+            if calibrated_temp is not None:
                 calibrated_temp = f"{calibrated_temp:.1f}°C"
+            else:
+                calibrated_temp = "N/A"
 
             status_str = f" [{', '.join(status)}]" if status else ""
             gcmd.respond_info(
@@ -362,20 +407,24 @@ class EddyTemperatureProfiles:
         self.profiles[name] = {
             'temp_min': temp_min,
             'temp_max': temp_max,
-            'calibration': {},
             'tap_adjust_z': 0.0,
             'reg_drive_current': 15,
             'tap_drive_current': 16,
+            'calibration_version': 5,
             'calibrated_at_temp': None
         }
 
         self.active_profile = name
-        self._save_profiles()
+
+        # Save to config
+        self._save_profile_to_config(name)
+        self._save_settings()
 
         gcmd.respond_info(
             f"Created profile '{name}' for {temp_min:.1f}-{temp_max:.1f}°C "
             f"(current temp: {current_temp:.1f}°C)"
         )
+        gcmd.respond_info("Run SAVE_CONFIG to persist changes")
 
     def _cmd_delete_profile(self, gcmd):
         """Delete profile"""
@@ -384,12 +433,18 @@ class EddyTemperatureProfiles:
         if name not in self.profiles:
             raise gcmd.error(f"Profile '{name}' not found")
 
+        # Delete from config
+        self._delete_profile_from_config(name)
+
+        # Delete from memory
         del self.profiles[name]
         if self.active_profile == name:
             self.active_profile = None
 
-        self._save_profiles()
+        self._save_settings()
+
         gcmd.respond_info(f"Deleted profile '{name}'")
+        gcmd.respond_info("Run SAVE_CONFIG to persist changes")
 
     def _cmd_select_profile(self, gcmd):
         """Select active profile"""
@@ -405,7 +460,9 @@ class EddyTemperatureProfiles:
             if name not in self.profiles:
                 raise gcmd.error(f"Profile '{name}' not found")
             self.activate_profile(name)
+            self._save_settings()
             gcmd.respond_info(f"Activated profile '{name}'")
+            gcmd.respond_info("Run SAVE_CONFIG to make active profile persistent")
         else:
             raise gcmd.error("NAME parameter required")
 
@@ -432,7 +489,7 @@ class EddyTemperatureProfiles:
             f"Saved calibration to profile '{self.active_profile}' "
             f"at {current_temp:.1f}°C"
         )
-        gcmd.respond_info("Run SAVE_CONFIG to persist all profiles")
+        gcmd.respond_info("Run SAVE_CONFIG to persist calibration")
 
     def _cmd_auto_switch(self, gcmd):
         """Enable/disable automatic profile switching"""
@@ -444,10 +501,11 @@ class EddyTemperatureProfiles:
         else:
             self.auto_switch_enabled = bool(enable)
 
-        self._save_profiles()
+        self._save_settings()
         gcmd.respond_info(
             f"Automatic profile switching {'enabled' if self.auto_switch_enabled else 'disabled'}"
         )
+        gcmd.respond_info("Run SAVE_CONFIG to persist changes")
 
     def _cmd_status(self, gcmd):
         """Show current profile system status"""
@@ -463,7 +521,7 @@ class EddyTemperatureProfiles:
         if self.active_profile and self.active_profile in self.profiles:
             profile = self.profiles[self.active_profile]
             gcmd.respond_info(f"Profile range: {profile['temp_min']:.1f}-{profile['temp_max']:.1f}°C")
-            if 'calibrated_at_temp' in profile and profile['calibrated_at_temp']:
+            if profile.get('calibrated_at_temp') is not None:
                 gcmd.respond_info(f"Calibrated at: {profile['calibrated_at_temp']:.1f}°C")
             gcmd.respond_info(f"TAP adjust Z: {profile.get('tap_adjust_z', 0.0):.3f}")
 
@@ -483,16 +541,16 @@ class EddyTemperatureProfiles:
 
 
 # Function for integration into __init__.py or probe_eddy_ng.py
-def add_temperature_profiles(probe_eddy_instance):
+def add_temperature_profiles(config, probe_eddy_instance):
     """
     Add temperature profile support to existing ProbeEddy instance
 
     Usage:
     In __init__.py after creating ProbeEddy:
     from probe_eddy_ng_temp_profiles import add_temperature_profiles
-    add_temperature_profiles(probe)
+    add_temperature_profiles(config, probe)
     """
-    probe_eddy_instance.temp_profiles = EddyTemperatureProfiles(probe_eddy_instance)
+    probe_eddy_instance.temp_profiles = EddyTemperatureProfiles(config, probe_eddy_instance)
 
     # Patch homing method for auto-profile selection
     original_home_start = probe_eddy_instance.home_start if hasattr(probe_eddy_instance, 'home_start') else None
