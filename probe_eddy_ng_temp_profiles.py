@@ -2,7 +2,11 @@
 """
 Temperature Profile Extension for probe_eddy_ng.py
 Adds temperature profile support for BTT Eddy
-Version: 2.0.2
+Version: 2.1.0
+Changes:
+- Proper tap_adjust_z handling per profile
+- Protection against global command interference
+- Profile-specific tap_adjust_z management
 """
 
 import logging
@@ -258,9 +262,12 @@ class EddyTemperatureProfiles:
         if 'tap_drive_current' in profile and hasattr(self.probe, '_tap_drive_current'):
             self.probe._tap_drive_current = int(profile['tap_drive_current'])
 
-        # Apply tap_adjust_z
+        # Apply tap_adjust_z with logging
         if 'tap_adjust_z' in profile and hasattr(self.probe, '_tap_adjust_z'):
+            old_tap_adjust = getattr(self.probe, '_tap_adjust_z', 0.0)
             self.probe._tap_adjust_z = float(profile['tap_adjust_z'])
+            if old_tap_adjust != self.probe._tap_adjust_z:
+                self.logger.info(f"Changed tap_adjust_z from {old_tap_adjust:.6f} to {profile['tap_adjust_z']:.6f}")
 
         # Apply calibration_version
         if 'calibration_version' in profile and hasattr(self.probe, '_calibration_version'):
@@ -277,7 +284,7 @@ class EddyTemperatureProfiles:
         self.logger.info(f"Activated profile '{profile_name}' with {len(profile.get('calibrations', {}))} calibrations")
         return True
 
-    def save_current_calibration(self, profile_name):
+    def save_current_calibration(self, profile_name, update_tap_adjust=True):
         """Save current calibration to specified profile"""
         if profile_name not in self.profiles:
             self.logger.error(f"Profile '{profile_name}' not found")
@@ -319,7 +326,20 @@ class EddyTemperatureProfiles:
 
         profile['reg_drive_current'] = getattr(self.probe, '_reg_drive_current', 16)
         profile['tap_drive_current'] = getattr(self.probe, '_tap_drive_current', 16)
-        profile['tap_adjust_z'] = getattr(self.probe, '_tap_adjust_z', 0.0)
+
+        # Only update tap_adjust_z if explicitly requested or if not set
+        if update_tap_adjust and hasattr(self.probe, '_tap_adjust_z'):
+            old_tap_adjust = profile.get('tap_adjust_z')
+            new_tap_adjust = getattr(self.probe, '_tap_adjust_z', 0.0)
+            if old_tap_adjust != new_tap_adjust:
+                self.logger.info(
+                    f"Updating tap_adjust_z in profile from {old_tap_adjust} to {new_tap_adjust:.6f}"
+                )
+                profile['tap_adjust_z'] = new_tap_adjust
+        elif 'tap_adjust_z' not in profile:
+            # If not set at all, use current value
+            profile['tap_adjust_z'] = getattr(self.probe, '_tap_adjust_z', 0.0)
+
         profile['calibration_version'] = getattr(self.probe, '_calibration_version', 5)
 
         # Save current temperature
@@ -350,6 +370,8 @@ class EddyTemperatureProfiles:
             self._cmd_auto_switch(gcmd)
         elif action == 'STATUS':
             self._cmd_status(gcmd)
+        elif action == 'SET_TAP_ADJUST':
+            self._cmd_set_profile_tap_adjust(gcmd)
         else:
             raise gcmd.error(f"Unknown action: {action}")
 
@@ -378,10 +400,12 @@ class EddyTemperatureProfiles:
             else:
                 calibrated_temp = "N/A"
 
+            tap_adjust = profile.get('tap_adjust_z', 0.0)
             status_str = f" [{', '.join(status)}]" if status else ""
+
             gcmd.respond_info(
                 f"  {name}: {profile['temp_min']:.1f}-{profile['temp_max']:.1f}°C "
-                f"(calibrated at {calibrated_temp}){status_str}"
+                f"(calibrated at {calibrated_temp}, tap_adjust_z={tap_adjust:.6f}){status_str}"
             )
 
     def _cmd_create_profile(self, gcmd):
@@ -403,11 +427,14 @@ class EddyTemperatureProfiles:
         if temp_min >= temp_max:
             raise gcmd.error(f"Invalid temperature range: {temp_min}-{temp_max}")
 
+        # Get current tap_adjust_z from probe
+        current_tap_adjust = getattr(self.probe, '_tap_adjust_z', 0.0)
+
         # Create profile
         self.profiles[name] = {
             'temp_min': temp_min,
             'temp_max': temp_max,
-            'tap_adjust_z': 0.0,
+            'tap_adjust_z': current_tap_adjust,
             'reg_drive_current': 15,
             'tap_drive_current': 16,
             'calibration_version': 5,
@@ -422,7 +449,7 @@ class EddyTemperatureProfiles:
 
         gcmd.respond_info(
             f"Created profile '{name}' for {temp_min:.1f}-{temp_max:.1f}°C "
-            f"(current temp: {current_temp:.1f}°C)"
+            f"(current temp: {current_temp:.1f}°C, tap_adjust_z: {current_tap_adjust:.6f})"
         )
         gcmd.respond_info("Run SAVE_CONFIG to persist changes")
 
@@ -484,7 +511,17 @@ class EddyTemperatureProfiles:
             if not gcmd.get_int('FORCE', 0):
                 raise gcmd.error("Use FORCE=1 to save anyway")
 
-        self.save_current_calibration(self.active_profile)
+        # Check if we should update tap_adjust_z
+        update_tap = gcmd.get_int('UPDATE_TAP_ADJUST', 1)
+
+        self.save_current_calibration(self.active_profile, update_tap_adjust=bool(update_tap))
+
+        if not update_tap:
+            gcmd.respond_info(
+                f"Saved calibration without updating tap_adjust_z "
+                f"(keeping {profile.get('tap_adjust_z', 0.0):.6f})"
+            )
+
         gcmd.respond_info(
             f"Saved calibration to profile '{self.active_profile}' "
             f"at {current_temp:.1f}°C"
@@ -539,6 +576,36 @@ class EddyTemperatureProfiles:
         if hasattr(self.probe, '_calibrated_drive_currents'):
             gcmd.respond_info(f"Current calibrated_drive_currents: {self.probe._calibrated_drive_currents}")
 
+    def _cmd_set_profile_tap_adjust(self, gcmd):
+        """Set tap_adjust_z for specific profile"""
+        profile_name = gcmd.get('PROFILE', self.active_profile)
+        if not profile_name or profile_name not in self.profiles:
+            raise gcmd.error(f"Profile '{profile_name}' not found")
+
+        value = gcmd.get_float('VALUE', None)
+        adjust = gcmd.get_float('ADJUST', None)
+
+        if value is None and adjust is None:
+            raise gcmd.error("Either VALUE or ADJUST parameter required")
+
+        profile = self.profiles[profile_name]
+        current = profile.get('tap_adjust_z', 0.0)
+
+        if value is not None:
+            profile['tap_adjust_z'] = value
+        elif adjust is not None:
+            profile['tap_adjust_z'] = current + adjust
+
+        # If this is the active profile, apply immediately
+        if profile_name == self.active_profile and hasattr(self.probe, '_tap_adjust_z'):
+            self.probe._tap_adjust_z = profile['tap_adjust_z']
+
+        self._save_profile_to_config(profile_name)
+        gcmd.respond_info(
+            f"Set tap_adjust_z={profile['tap_adjust_z']:.6f} for profile '{profile_name}'"
+        )
+        gcmd.respond_info("Run SAVE_CONFIG to persist changes")
+
 
 # Function for integration into __init__.py or probe_eddy_ng.py
 def add_temperature_profiles(config, probe_eddy_instance):
@@ -551,6 +618,54 @@ def add_temperature_profiles(config, probe_eddy_instance):
     add_temperature_profiles(config, probe)
     """
     probe_eddy_instance.temp_profiles = EddyTemperatureProfiles(config, probe_eddy_instance)
+
+    # Patch global commands to sync with profiles
+    original_set_tap_adjust_z = probe_eddy_instance.cmd_SET_TAP_ADJUST_Z
+    original_z_offset_apply = probe_eddy_instance.cmd_Z_OFFSET_APPLY_PROBE
+
+    def patched_set_tap_adjust_z(gcmd):
+        # Call original
+        original_set_tap_adjust_z(gcmd)
+
+        # Update in active profile if exists
+        if probe_eddy_instance.temp_profiles.active_profile:
+            profile = probe_eddy_instance.temp_profiles.profiles.get(
+                probe_eddy_instance.temp_profiles.active_profile
+            )
+            if profile:
+                old_value = profile.get('tap_adjust_z', 0.0)
+                profile['tap_adjust_z'] = probe_eddy_instance._tap_adjust_z
+                probe_eddy_instance.temp_profiles.logger.info(
+                    f"Updated tap_adjust_z in profile '{probe_eddy_instance.temp_profiles.active_profile}' "
+                    f"from {old_value:.6f} to {profile['tap_adjust_z']:.6f}"
+                )
+                gcmd.respond_info(
+                    f"Updated tap_adjust_z in active profile '{probe_eddy_instance.temp_profiles.active_profile}'"
+                )
+
+    def patched_z_offset_apply(gcmd):
+        # Call original
+        original_z_offset_apply(gcmd)
+
+        # Update in active profile if exists
+        if probe_eddy_instance.temp_profiles.active_profile:
+            profile = probe_eddy_instance.temp_profiles.profiles.get(
+                probe_eddy_instance.temp_profiles.active_profile
+            )
+            if profile:
+                old_value = profile.get('tap_adjust_z', 0.0)
+                profile['tap_adjust_z'] = probe_eddy_instance._tap_adjust_z
+                probe_eddy_instance.temp_profiles.logger.info(
+                    f"Applied Z offset to profile '{probe_eddy_instance.temp_profiles.active_profile}' "
+                    f"from {old_value:.6f} to {profile['tap_adjust_z']:.6f}"
+                )
+                gcmd.respond_info(
+                    f"Applied Z offset to active profile '{probe_eddy_instance.temp_profiles.active_profile}'"
+                )
+
+    # Replace commands
+    probe_eddy_instance.cmd_SET_TAP_ADJUST_Z = patched_set_tap_adjust_z
+    probe_eddy_instance.cmd_Z_OFFSET_APPLY_PROBE = patched_z_offset_apply
 
     # Patch homing method for auto-profile selection
     original_home_start = probe_eddy_instance.home_start if hasattr(probe_eddy_instance, 'home_start') else None
