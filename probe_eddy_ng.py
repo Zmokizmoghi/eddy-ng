@@ -528,6 +528,20 @@ class ProbeEddy:
         # runtime configurable
         self._tap_adjust_z = self.params.tap_adjust_z
 
+        # Dynamic threshold for survey mode
+        self._survey_threshold = None
+        self._survey_threshold_confidence = 0.0
+
+        # Load saved threshold from config if available
+        self._saved_survey_threshold = asfc.getfloat(self._full_name, "survey_threshold", fallback=None)
+        self._saved_survey_threshold_confidence = asfc.getfloat(self._full_name, "survey_threshold_confidence", fallback=0.0)
+
+        # Use saved threshold if available and confidence is good
+        if self._saved_survey_threshold is not None and self._saved_survey_threshold_confidence > 0.5:
+            self._survey_threshold = self._saved_survey_threshold
+            self._survey_threshold_confidence = self._saved_survey_threshold_confidence
+            self._log_info(f"Loaded saved survey threshold: {self._survey_threshold:.3f}mm (confidence: {self._survey_threshold_confidence:.2f})")
+
         # define our own commands
         self._dummy_gcode_cmd: GCodeCommand = self._gcode.create_gcode_command("", "", {})
         self.define_commands(self._gcode)
@@ -540,23 +554,23 @@ class ProbeEddy:
             bed_mesh.ProbeManager.start_probe = bed_mesh_ProbeManager_start_probe_override
 
     def _log_error(self, msg):
-        logging.error(f"{self._name}: {msg}")
+        logging.error(f"{self._name}_pol: {msg}")
         self._gcode.respond_raw(f"!! EDDYng: {msg}\n")
 
     def _log_warning(self, msg):
-        logging.warning(f"{self._name}: {msg}")
+        logging.warning(f"{self._name}_pol: {msg}")
         self._gcode.respond_raw(f"!! EDDYng: {msg}\n")
 
     def _log_msg(self, msg):
-        logging.info(f"{self._name}: {msg}")
+        logging.info(f"{self._name}_pol: {msg}")
         self._gcode.respond_info(f"{msg}", log=False)
 
     def _log_info(self, msg):
-        logging.info(f"{self._name}: {msg}")
+        logging.info(f"{self._name}_pol: {msg}")
 
     def _log_debug(self, msg):
         if self.params.debug:
-            logging.info(f"{self._name}: {msg}")
+            logging.info(f"{self._name}_pol: {msg}")
 
     def define_commands(self, gcode):
         gcode.register_command("PROBE_EDDY_NG_STATUS", self.cmd_STATUS, self.cmd_STATUS_help)
@@ -592,6 +606,36 @@ class ProbeEddy:
             self.cmd_PROBE_ACCURACY_help,
         )
         gcode.register_command("PROBE_EDDY_NG_TAP", self.cmd_TAP, self.cmd_TAP_help)
+        gcode.register_command(
+            "PROBE_EDDY_NG_SURVEY",
+            self.cmd_SURVEY,
+            "Temperature-independent probe using polynomial model (experimental)"
+        )
+        gcode.register_command(
+            "PROBE_EDDY_NG_CALIBRATE_POLY",
+            self.cmd_CALIBRATE_POLY,
+            "Calibrate with polynomial model for survey mode"
+        )
+        gcode.register_command(
+            "PROBE_EDDY_NG_THRESHOLD_SCAN",
+            self.cmd_THRESHOLD_SCAN,
+            "Find optimal touch threshold automatically"
+        )
+        gcode.register_command(
+            "PROBE_EDDY_NG_THRESHOLD_STATUS",
+            self.cmd_THRESHOLD_STATUS,
+            "Show current threshold status"
+        )
+        gcode.register_command(
+            "PROBE_EDDY_NG_THRESHOLD_SAVE",
+            self.cmd_THRESHOLD_SAVE,
+            "Save current threshold to config (requires SAVE_CONFIG)"
+        )
+        gcode.register_command(
+            "PROBE_EDDY_NG_THRESHOLD_CLEAR",
+            self.cmd_THRESHOLD_CLEAR,
+            "Clear saved threshold from config (requires SAVE_CONFIG)"
+        )
         gcode.register_command(
             "PROBE_EDDY_NG_SET_TAP_OFFSET",
             self.cmd_SET_TAP_OFFSET,
@@ -776,6 +820,11 @@ class ProbeEddy:
 
         if self.params.tap_drive_current != self._tap_drive_current or self.params.tap_drive_current == self._saved_tap_drive_current:
             configfile.set(self._full_name, "tap_drive_current", str(self._tap_drive_current))
+
+        # Save survey threshold if available
+        if self._saved_survey_threshold is not None and self._saved_survey_threshold_confidence > 0.0:
+            configfile.set(self._full_name, "survey_threshold", f"{self._saved_survey_threshold:.6f}")
+            configfile.set(self._full_name, "survey_threshold_confidence", f"{self._saved_survey_threshold_confidence:.3f}")
 
         for _, fmap in self._dc_to_fmap.items():
             fmap.save_calibration()
@@ -1251,6 +1300,126 @@ class ProbeEddy:
             lambda kin_pos: self.cmd_CALIBRATE_next(gcmd, kin_pos),
         )
 
+    def cmd_CALIBRATE_POLY(self, gcmd: GCodeCommand):
+        """Calibrate using polynomial model for survey mode"""
+        if not self._xy_homed():
+            raise self._printer.command_error("X and Y must be homed before calibrating")
+
+        if self._z_homed():
+            self._z_hop()
+
+        # Now reset the axis so that we have a full range to calibrate with
+        th = self._printer.lookup_object("toolhead")
+        th_pos = th.get_position()
+        zrange = th.get_kinematics().rails[2].get_range()
+        th_pos[2] = zrange[1] - 20.0
+        self._set_toolhead_position(th_pos, [2])
+
+        manual_probe.ManualProbeHelper(
+            self._printer,
+            gcmd,
+            lambda kin_pos: self.cmd_CALIBRATE_POLY_next(gcmd, kin_pos),
+        )
+
+    def cmd_CALIBRATE_POLY_next(self, gcmd: GCodeCommand, kin_pos: Optional[List[float]]):
+        """Continue polynomial calibration after manual probe"""
+        if kin_pos is None:
+            self._z_not_homed()
+            return
+
+        old_drive_current = self.current_drive_current()
+        drive_current: int = gcmd.get_int("DRIVE_CURRENT", old_drive_current, minval=0, maxval=31)
+        cal_z_max: float = gcmd.get_float("START_Z", self.params.calibration_z_max, above=2.0)
+        z_target: float = gcmd.get_float("TARGET_Z", 0.0)
+
+        probe_speed: float = gcmd.get_float("SPEED", self.params.probe_speed, above=0.0)
+        lift_speed: float = gcmd.get_float("LIFT_SPEED", self.params.lift_speed, above=0.0)
+
+        th = self._printer.lookup_object("toolhead")
+        th_pos = th.get_position()
+        th_pos[2] = 0.0
+        self._set_toolhead_position(th_pos, [2])
+        th.wait_moves()
+
+        # Move to calibration position
+        th.manual_move([None, None, cal_z_max + 3.0], lift_speed)
+        th.manual_move(
+            [
+                th_pos[0] - self.offset["x"],
+                th_pos[1] - self.offset["y"],
+                None,
+            ],
+            self.params.move_speed,
+        )
+
+        # Create mapping with polynomial flag
+        mapping, fth_fit, htf_fit = self._create_mapping_poly(
+            cal_z_max,
+            z_target,
+            probe_speed,
+            lift_speed,
+            drive_current,
+            report_errors=True,
+            write_debug_files=True,
+        )
+
+        if mapping is None or fth_fit is None or htf_fit is None:
+            self._log_error("Polynomial calibration failed")
+            return
+
+        self._dc_to_fmap[drive_current] = mapping
+        self.save_config()
+        self._z_not_homed()
+
+        self._log_msg("Polynomial calibration complete. Survey mode is now available.")
+
+    def _create_mapping_poly(
+        self,
+        z_start: float,
+        z_target: float,
+        probe_speed: float,
+        lift_speed: float,
+        drive_current: int,
+        report_errors: bool,
+        write_debug_files: bool,
+    ) -> Tuple[ProbeEddyFrequencyMap, float, float]:
+        """Create mapping with polynomial model"""
+        th = self._printer.lookup_object("toolhead")
+        th_pos = th.get_position()
+
+        # Move to start position
+        if th_pos[2] < z_start:
+            th.manual_move([None, None, z_start + 3.0], lift_speed)
+        th.manual_move([None, None, z_start], lift_speed)
+
+        old_drive_current = self.current_drive_current()
+        try:
+            self._sensor.set_drive_current(drive_current)
+            times, freqs, heights, vels = self._capture_samples_down_to(z_target, probe_speed)
+            th.manual_move([None, None, z_start + 3.0], lift_speed)
+        finally:
+            self._sensor.set_drive_current(old_drive_current)
+
+        if times is None:
+            if report_errors:
+                self._log_error(f"Drive current {drive_current}: No samples collected.")
+            return None, None, None
+
+        # Build map with polynomial flag
+        mapping = ProbeEddyFrequencyMap(self)
+        fth_fit, htf_fit = mapping.calibrate_from_values(
+            drive_current,
+            times,
+            freqs,
+            heights,
+            vels,
+            report_errors,
+            write_debug_files,
+            use_polynomial=True,  # Use polynomial model
+        )
+
+        return mapping, fth_fit, htf_fit
+
     def cmd_CALIBRATE_next(self, gcmd: GCodeCommand, kin_pos: Optional[List[float]]):
         th = self._printer.lookup_object("toolhead")
         if kin_pos is None:
@@ -1459,6 +1628,8 @@ class ProbeEddy:
                 "tap_adjust_z": float(self._tap_adjust_z),
                 "last_probe_result": float(self._last_probe_result),
                 "last_tap_z": float(self._last_tap_z),
+                "survey_threshold": float(self._survey_threshold) if self._survey_threshold is not None else None,
+                "survey_threshold_confidence": float(self._survey_threshold_confidence),
             }
         )
         return status
@@ -1616,6 +1787,452 @@ class ProbeEddy:
     # Tap probe
     #
     cmd_TAP_help = "Calculate a z-offset by touching the build plate."
+
+    def cmd_SURVEY(self, gcmd: GCodeCommand):
+        """Temperature-independent survey mode (like Cartographer)"""
+        if not self._z_homed():
+            raise self._printer.command_error("Z axis must be homed before survey")
+
+        if not self.calibrated():
+            raise self._printer.command_error("Eddy probe not calibrated!")
+
+        # Survey-specific parameters
+        probe_speed = gcmd.get_float("SPEED", self.params.tap_speed, above=0.0)
+        lift_speed = gcmd.get_float("LIFT_SPEED", self.params.lift_speed, above=0.0)
+        samples = gcmd.get_int("SAMPLES", 3, minval=1)
+        tolerance = gcmd.get_float("TOLERANCE", 0.010, above=0.0)
+        start_z = gcmd.get_float("START_Z", 5.0, above=2.0)
+        home_z = gcmd.get_int("HOME_Z", 1) == 1
+        z_offset = gcmd.get_float("Z_OFFSET", 0.0)  # Manual offset adjustment for survey
+
+        th = self._printer.lookup_object("toolhead")
+        results = []
+
+        # Move to start position
+        self.probe_to_start_position(start_z)
+
+        for i in range(samples):
+            # Do a probe move
+            target_position = th.get_position()
+            target_position[2] = -1.0  # Probe downward
+
+            try:
+                # Use standard endstop
+                endstops = [(self._endstop_wrapper, "probe")]
+                hmove = HomingMove(self._printer, endstops)
+                probe_position = hmove.homing_move(target_position, probe_speed, probe_pos=True)
+
+                if hmove.check_no_movement() is not None:
+                    raise self._printer.command_error("Probe triggered prior to movement")
+
+                # The probe triggers at home_trigger_height, but we want actual Z=0
+                # Use dynamic threshold if available, otherwise fall back to home_trigger_height
+                probe_z = probe_position[2]
+
+                if self._survey_threshold is not None and self._survey_threshold_confidence > 0.5:
+                    # Use dynamically found threshold
+                    actual_z = probe_z + self._survey_threshold
+                    self._log_debug(f"Using dynamic threshold: {self._survey_threshold:.3f}")
+                else:
+                    # Fall back to static trigger height
+                    actual_z = probe_z - self.params.home_trigger_height
+                    self._log_debug(f"Using static trigger height: {self.params.home_trigger_height:.3f}")
+
+                results.append(actual_z)
+
+                self._log_msg(f"Survey sample {i+1}: trigger at z={probe_z:.3f}, actual z={actual_z:.3f}")
+
+                # Lift back up
+                th.manual_move([None, None, start_z], lift_speed)
+                th.wait_moves()
+
+            except self._printer.command_error as err:
+                self._log_error(f"Survey failed: {err}")
+                raise
+
+        # Calculate median result
+        if len(results) > 0:
+            median_z = float(np.median(results))
+            stddev = float(np.std(results)) if len(results) > 1 else 0.0
+
+            if stddev > tolerance:
+                self._log_warning(f"Survey stddev {stddev:.4f} exceeds tolerance {tolerance:.4f}")
+
+            # Apply manual Z_OFFSET adjustment
+            adjusted_z = median_z + z_offset
+
+            self._log_msg(f"Survey complete: median actual z={median_z:.3f} (stddev={stddev:.4f})")
+            if z_offset != 0.0:
+                self._log_msg(f"Applying Z_OFFSET={z_offset:.3f}, adjusted z={adjusted_z:.3f}")
+
+            if home_z:
+                # Set the Z position to the actual bed surface with offset
+                th_pos = th.get_position()
+                # Current position minus the adjusted z gives us the true zero
+                th_pos[2] = th_pos[2] - adjusted_z
+                self._set_toolhead_position(th_pos, [2])
+                self._log_msg(f"Homed Z to 0.0 (was at {adjusted_z:.3f})")
+
+            # No tap_offset adjustment for survey mode
+            self._tap_offset = 0.0
+
+            # Update gcode position
+            gcode_move = self._printer.lookup_object("gcode_move")
+            gcode_move.base_position[2] = 0.0
+            gcode_move.homing_position[2] = 0.0
+
+        else:
+            raise self._printer.command_error("Survey failed: no valid samples")
+
+    def cmd_THRESHOLD_SCAN(self, gcmd: GCodeCommand):
+        """Automatically find optimal touch threshold for survey mode"""
+        if not self._z_homed():
+            raise self._printer.command_error("Z axis must be homed before threshold scan")
+
+        if not self.calibrated():
+            raise self._printer.command_error("Eddy probe not calibrated!")
+
+        # Check polynomial calibration
+        current_map = self.map_for_drive_current()
+        if not hasattr(current_map, '_use_polynomial') or not current_map._use_polynomial:
+            raise self._printer.command_error("Threshold scan requires polynomial calibration. Run PROBE_EDDY_NG_CALIBRATE_POLY first.")
+
+        # Parameters
+        start_z = gcmd.get_float("START_Z", 2.0, above=0.5)
+        approach_speed = gcmd.get_float("APPROACH_SPEED", 1.0, above=0.1)
+        scan_speed = gcmd.get_float("SCAN_SPEED", 0.5, above=0.1)
+        retries = gcmd.get_int("RETRIES", 3, minval=1)
+
+        # Display scan parameters
+        self._log_info("=" * 50)
+        self._log_info("STARTING THRESHOLD SCAN")
+        self._log_info("=" * 50)
+        self._log_debug(f"Parameters:")
+        self._log_debug(f"  Start Z: {start_z:.2f}mm")
+        self._log_debug(f"  Scan speed: {scan_speed:.2f}mm/s")
+        self._log_debug(f"  Retries: {retries}")
+        self._log_debug(f"  Current trigger height: {self.params.home_trigger_height:.3f}mm")
+        self._log_debug("-" * 50)
+
+        # Log with modified name for threshold scanning
+        orig_debug = self.params.debug
+        # Enable debug for threshold scanning
+        self.params.debug = True
+
+        try:
+            threshold_results = []
+
+            for attempt in range(retries):
+                self._log_info(f"\n→ Scan attempt {attempt + 1}/{retries}")
+                self._log_debug(f"  Moving to start position Z={start_z:.2f}mm...")
+
+                # Perform threshold scan
+                threshold = self._do_threshold_scan(
+                    start_z, approach_speed, scan_speed
+                )
+
+                if threshold is not None:
+                    threshold_results.append(threshold)
+                    self._log_info(f"  ✓ Found contact at Z={threshold:.3f}mm")
+                else:
+                    self._log_warning(f"  ✗ Attempt {attempt + 1} failed to detect contact")
+
+            # Analyze results
+            self._log_info("\n" + "=" * 50)
+            self._log_info("SCAN RESULTS")
+            self._log_info("=" * 50)
+
+            if len(threshold_results) >= 2:
+                median_threshold = float(np.median(threshold_results))
+                std_dev = float(np.std(threshold_results))
+                confidence = max(0.0, 1.0 - (std_dev / median_threshold))
+
+                # Convert absolute threshold to relative offset from home_trigger_height
+                self._survey_threshold = median_threshold - self.params.home_trigger_height
+                self._survey_threshold_confidence = confidence
+
+                # Display detailed results
+                self._log_debug(f"Successful scans: {len(threshold_results)}/{retries}")
+                self._log_debug(f"Contact points: {[f'{t:.3f}' for t in threshold_results]}")
+                self._log_debug(f"Median contact: {median_threshold:.3f}mm")
+                self._log_debug(f"Standard deviation: {std_dev:.4f}mm")
+                self._log_info(f"Confidence level: {confidence:.2f} ({self._get_confidence_rating(confidence)})")
+                self._log_debug("-" * 50)
+                self._log_info(f"THRESHOLD OFFSET: {self._survey_threshold:.3f}mm")
+                self._log_debug(f"(relative to trigger height {self.params.home_trigger_height:.3f}mm)")
+
+                if confidence < 0.8:
+                    self._log_warning("\n⚠ WARNING: Low confidence threshold")
+                    self._log_debug("  Consider:")
+                    self._log_debug("  - Cleaning the nozzle and bed surface")
+                    self._log_debug("  - Adjusting scan speed (try SCAN_SPEED=0.3)")
+                    self._log_debug("  - Increasing retries (try RETRIES=5)")
+                else:
+                    self._log_info("\n✓ HIGH CONFIDENCE THRESHOLD DETECTED")
+
+                # Suggest saving if not already saved
+                if self._saved_survey_threshold != self._survey_threshold:
+                    self._log_info("\n Run PROBE_EDDY_NG_THRESHOLD_SAVE to save this threshold")
+                    self._log_info("         Then SAVE_CONFIG to make it permanent")
+
+            elif len(threshold_results) == 1:
+                self._survey_threshold = threshold_results[0] - self.params.home_trigger_height
+                self._survey_threshold_confidence = 0.5
+                self._log_warning(f"⚠ Only 1 successful scan out of {retries} attempts")
+                self._log_debug(f"Contact point: {threshold_results[0]:.3f}mm")
+                self._log_info(f"Threshold offset: {self._survey_threshold:.3f}mm")
+                self._log_info(f"Confidence: LOW (0.50)")
+                self._log_debug("\nRecommendation: Re-run scan with adjusted parameters")
+            else:
+                self._log_error("✗ SCAN FAILED")
+                self._log_error(f"All {retries} attempts failed to detect contact")
+                self._log_debug("\nPossible causes:")
+                self._log_debug("  - Nozzle too far from bed (try lower START_Z)")
+                self._log_debug("  - Dirty nozzle or bed surface")
+                self._log_debug("  - Incorrect probe calibration")
+                raise self._printer.command_error("All threshold scan attempts failed")
+
+            self._log_info("=" * 50)
+            self._log_info("THRESHOLD SCAN COMPLETE")
+            self._log_info("=" * 50)
+
+        finally:
+            self.params.debug = orig_debug
+
+    def _get_confidence_rating(self, confidence: float) -> str:
+        """Get human-readable confidence rating"""
+        if confidence >= 0.9:
+            return "EXCELLENT"
+        elif confidence >= 0.8:
+            return "HIGH"
+        elif confidence >= 0.6:
+            return "MEDIUM"
+        elif confidence >= 0.4:
+            return "LOW"
+        else:
+            return "VERY LOW"
+
+    def _do_threshold_scan(self, start_z: float, approach_speed: float,
+                          scan_speed: float) -> float:
+        """Perform single threshold scan attempt using acceleration-based detection"""
+        th = self._printer.lookup_object("toolhead")
+
+        # Move to start position
+        self.probe_to_start_position(start_z)
+
+        # Data collection arrays
+        heights = []
+        freqs = []
+        times = []
+
+        # Use a step-by-step approach instead of continuous sampling
+        step_size = 0.02  # 0.02mm steps for faster scanning
+        current_z = start_z
+        baseline_freq = None
+        last_freq = None
+        max_change_rate = 0.0
+        touch_height = None
+
+        # Collect baseline frequency at start height
+        self._log_debug(f"  Collecting baseline frequency...")
+        with self.start_sampler(calculate_heights=False) as sampler:
+            th.dwell(0.1)
+            th.wait_moves()
+            sampler.finish()
+
+        if sampler.raw_count > 0:
+            baseline_freq = sampler.freqs[-1]
+            self._log_debug(f"  Baseline: {baseline_freq:.1f} Hz at Z={start_z:.3f}mm")
+        else:
+            raise self._printer.command_error("Failed to get baseline frequency")
+
+        # Arrays for acceleration-based analysis
+        freq_derivatives = []  # First derivative (rate of change)
+        freq_accelerations = []  # Second derivative (acceleration)
+
+        self._log_debug(f"  Scanning for bed contact...")
+        progress_counter = 0
+
+        try:
+            while current_z > -0.250:  # Safety limit - stop just before bed contact
+                # Move to current position
+                th.manual_move([None, None, current_z], scan_speed)
+                th.wait_moves()
+
+                # Take a reading at this position
+                with self.start_sampler(calculate_heights=False) as sampler:
+                    th.dwell(0.05)  # Wait for samples - reduced from 0.1 to 0.05
+                    th.wait_moves()
+                    sampler.finish()
+
+                if sampler.raw_count > 0:
+                    current_freq = sampler.freqs[-1]
+
+                    heights.append(current_z)
+                    freqs.append(current_freq)
+                    times.append(sampler.times[-1])
+
+                    # Show progress every 10 steps (0.2mm)
+                    progress_counter += 1
+                    if progress_counter % 10 == 0:
+                        freq_change = ((current_freq - baseline_freq) / baseline_freq) * 100
+                        self._log_debug(f"    Z={current_z:.3f}mm, Freq change: {freq_change:+.1f}%")
+
+                    # Calculate derivatives after we have enough points
+                    if len(freqs) >= 3:
+                        # Calculate first derivative (frequency change rate per mm)
+                        freq_rate = (freqs[-1] - freqs[-2]) / step_size
+                        freq_derivatives.append(freq_rate)
+
+                        # Calculate second derivative (acceleration) after we have enough derivatives
+                        if len(freq_derivatives) >= 2:
+                            freq_accel = (freq_derivatives[-1] - freq_derivatives[-2]) / step_size
+                            freq_accelerations.append(freq_accel)
+
+                    freq_delta = current_freq - baseline_freq
+
+                    # Analyze for contact detection after collecting enough data
+                    if len(freq_accelerations) >= 3:
+                        # Use last 3 acceleration values for stability
+                        recent_accel = freq_accelerations[-3:]
+                        avg_accel = float(np.mean(recent_accel))
+                        current_rate = freq_derivatives[-1] if freq_derivatives else 0
+
+                        self._log_debug(f"Z={current_z:.3f}, freq={current_freq:.1f}, δf={freq_delta:.1f}, "
+                                      f"rate={current_rate:.0f}, accel={avg_accel:.0f}")
+
+                        # Contact detection using sliding median filter approach:
+                        min_freq_increase = baseline_freq * 0.015  # 1.5% minimum increase
+
+                        # Sliding median filter detection after we have enough data points
+                        if len(freq_derivatives) >= 10:
+                            # Compare recent vs previous rate medians (5 points each)
+                            recent_rates = freq_derivatives[-5:]  # Last 5 rates
+                            prev_rates = freq_derivatives[-10:-5]  # Previous 5 rates
+
+                            recent_median = float(np.median(recent_rates))
+                            prev_median = float(np.median(prev_rates))
+
+                            self._log_debug(f"Z={current_z:.3f}, δf={freq_delta:.1f}, "
+                                          f"prev_rate_med={prev_median:.0f}, recent_rate_med={recent_median:.0f}")
+
+                            # Detection criteria:
+                            # 1. Minimum frequency increase
+                            # 2. Significant slowdown: previous median > recent median * factor
+                            slowdown_factor = 1.5  # 50% slowdown threshold
+
+                            if (freq_delta > min_freq_increase and
+                                prev_median > 20000 and  # Previous growth was significant
+                                recent_median < prev_median / slowdown_factor):  # Strong slowdown detected
+
+                                touch_height = current_z
+                                freq_change_pct = ((current_freq - baseline_freq) / baseline_freq) * 100
+                                self._log_info(f"  ✓ BED CONTACT DETECTED!")
+                                self._log_debug(f"    Z position: {current_z:.3f}mm")
+                                self._log_debug(f"    Frequency change: {freq_change_pct:.1f}%")
+                                self._log_debug(f"    Growth rate slowdown: {prev_median/recent_median:.1f}x")
+                                break
+
+                        # Fallback detection for early stages or emergency cases
+                        elif (freq_delta > min_freq_increase and
+                            (current_rate < 10000 or abs(avg_accel) > 300000)):
+
+                            touch_height = current_z
+                            freq_change_pct = ((current_freq - baseline_freq) / baseline_freq) * 100
+                            self._log_info(f"  ✓ BED CONTACT DETECTED (fallback method)")
+                            self._log_debug(f"    Z position: {current_z:.3f}mm")
+                            self._log_debug(f"    Frequency change: {freq_change_pct:.1f}%")
+                            break
+
+                        # Emergency break if frequency increase is massive (avoid crashes)
+                        if freq_delta > baseline_freq * 0.06:  # 6% emergency threshold
+                            touch_height = current_z
+                            freq_change_pct = ((current_freq - baseline_freq) / baseline_freq) * 100
+                            self._log_warning(f"  ⚠ EMERGENCY STOP - Large frequency change detected")
+                            self._log_debug(f"    Z position: {current_z:.3f}mm")
+                            self._log_debug(f"    Frequency change: {freq_change_pct:.1f}%")
+                            break
+
+                    last_freq = current_freq
+                else:
+                    self._log_warning("No samples collected at this position")
+
+                current_z -= step_size
+
+            # Check if we've gone through the entire scan without detecting contact
+            if touch_height is None:
+                self._log_warning(f"  ✗ No contact detected during scan")
+                self._log_debug(f"    Scanned from Z={start_z:.3f}mm to Z={current_z:.3f}mm")
+                if len(freqs) > 0:
+                    final_freq_change = ((freqs[-1] - baseline_freq) / baseline_freq) * 100
+                    self._log_debug(f"    Final frequency change: {final_freq_change:.1f}%")
+                    if final_freq_change < 1.0:
+                        self._log_debug(f"    Suggestion: Nozzle may be too far from bed, try lower START_Z")
+
+        except Exception as e:
+            self._log_error(f"Threshold scan failed: {e}")
+            return None
+
+        # Lift back up
+        self._log_debug(f"  Returning to safe height...")
+        th.manual_move([None, None, start_z], 10.0)
+        th.wait_moves()
+
+        return touch_height
+
+    def cmd_THRESHOLD_STATUS(self, gcmd: GCodeCommand):
+        """Show current dynamic threshold status"""
+        if self._survey_threshold is not None:
+            self._log_msg(f"Dynamic threshold: {self._survey_threshold:.3f}mm")
+            self._log_msg(f"Confidence: {self._survey_threshold_confidence:.2f}")
+
+            if self._survey_threshold_confidence > 0.8:
+                status = "HIGH (recommended for use)"
+            elif self._survey_threshold_confidence > 0.5:
+                status = "MEDIUM (usable but consider re-scanning)"
+            else:
+                status = "LOW (not recommended, re-scan required)"
+
+            self._log_msg(f"Status: {status}")
+
+            # Check if saved threshold differs from current
+            if self._saved_survey_threshold != self._survey_threshold:
+                self._log_msg("Note: Current threshold differs from saved value. Run PROBE_EDDY_NG_THRESHOLD_SAVE to update.")
+        else:
+            self._log_msg("No dynamic threshold found. Run PROBE_EDDY_NG_THRESHOLD_SCAN first.")
+            self._log_msg(f"Falling back to static trigger height: {self.params.home_trigger_height:.3f}mm")
+
+    def cmd_THRESHOLD_SAVE(self, gcmd: GCodeCommand):
+        """Save current threshold to config file"""
+        if self._survey_threshold is None:
+            raise self._printer.command_error("No threshold to save. Run PROBE_EDDY_NG_THRESHOLD_SCAN first.")
+
+        if self._survey_threshold_confidence < 0.5:
+            gcmd.respond_info("Warning: Threshold confidence is low. Consider re-scanning for better accuracy.")
+
+        configfile = self._printer.lookup_object("configfile")
+        configfile.set(self._full_name, "survey_threshold", f"{self._survey_threshold:.6f}")
+        configfile.set(self._full_name, "survey_threshold_confidence", f"{self._survey_threshold_confidence:.3f}")
+
+        # Update saved values
+        self._saved_survey_threshold = self._survey_threshold
+        self._saved_survey_threshold_confidence = self._survey_threshold_confidence
+
+        self._log_msg(f"Survey threshold {self._survey_threshold:.3f}mm saved to config (confidence: {self._survey_threshold_confidence:.2f})")
+        self._log_msg("Run SAVE_CONFIG to make it permanent")
+
+    def cmd_THRESHOLD_CLEAR(self, gcmd: GCodeCommand):
+        """Clear saved threshold from config file"""
+        # Clear runtime values
+        self._survey_threshold = None
+        self._survey_threshold_confidence = 0.0
+        self._saved_survey_threshold = None
+        self._saved_survey_threshold_confidence = 0.0
+
+        # Update config by saving config but threshold values will be None
+        # The save_config method will handle not writing None values
+        self._log_msg("Survey threshold cleared")
+        self._log_msg("Note: Threshold values will be removed on next SAVE_CONFIG")
 
     def cmd_TAP(self, gcmd: GCodeCommand):
         drive_current = self._sensor.get_drive_current()
@@ -2824,6 +3441,10 @@ class ProbeEddyFrequencyMap:
         self._ftoh_high: Optional[npp.Polynomial] = None
         self._htof: Optional[npp.Polynomial] = None
 
+        # Polynomial model for survey mode (temperature-independent)
+        self._poly_model: Optional[npp.Polynomial] = None
+        self._use_polynomial = False
+
     def _str_to_exact_floatlist(self, str):
         return [float.fromhex(v) for v in str.split(",")]
 
@@ -2858,6 +3479,8 @@ class ProbeEddyFrequencyMap:
         dc = data.get("dc", None)
         h_range = data.get("h_range", (math.inf, -math.inf))
         f_range = data.get("f_range", (math.inf, -math.inf))
+        poly_model = data.get("poly_model", None)  # Load polynomial model
+        use_polynomial = data.get("use_polynomial", False)  # Load flag
 
         if dc != drive_current:
             raise configerror(f"ProbeEddyFrequencyMap: drive current mismatch: loaded {dc} != requested {drive_current}")
@@ -2868,8 +3491,14 @@ class ProbeEddyFrequencyMap:
         self.height_range = h_range
         self.freq_range = f_range
         self.drive_current = drive_current
+        self._poly_model = poly_model  # Load polynomial model
+        self._use_polynomial = use_polynomial  # Load flag
 
-        self._eddy._log_info(f"Loaded calibration for drive current {drive_current}")
+        if use_polynomial:
+            # Log with modified name for polynomial mode
+            self._eddy._log_info(f"Loaded polynomial calibration for drive current {drive_current}")
+        else:
+            self._eddy._log_info(f"Loaded standard calibration for drive current {drive_current}")
         return True
 
     def save_calibration(self):
@@ -2885,6 +3514,8 @@ class ProbeEddyFrequencyMap:
             "h_range": self.height_range,
             "f_range": self.freq_range,
             "dc": self.drive_current,
+            "poly_model": self._poly_model,  # Save polynomial model
+            "use_polynomial": self._use_polynomial,  # Save flag
         }
         calibstr = base64.b64encode(pickle.dumps(data)).decode()
         configfile.set(self._eddy._full_name, f"calibration_{self.drive_current}", calibstr)
@@ -2898,6 +3529,7 @@ class ProbeEddyFrequencyMap:
         raw_vels_list: List[float],
         report_errors: bool,
         write_debug_files: bool,
+        use_polynomial: bool = False,
     ):
         if len(raw_freqs_list) != len(raw_heights_list):
             raise ValueError("freqs and heights must be the same length")
@@ -2967,14 +3599,48 @@ class ProbeEddyFrequencyMap:
         low_samples = heights <= ProbeEddyFrequencyMap.low_z_threshold
         high_samples = heights >= ProbeEddyFrequencyMap.low_z_threshold - 0.5
 
-        ftoh_low_fn = npp.Polynomial.fit(1.0 / freqs[low_samples], heights[low_samples], deg=9)
-        htof_low_fn = npp.Polynomial.fit(heights[low_samples], 1.0 / freqs[low_samples], deg=9)
+        if use_polynomial:
+            # Use polynomial model for survey mode (like Cartographer)
+            # Fit polynomial from 1/freq to height for entire range
+            # Try lower degree first for better stability
+            best_deg = 9
+            best_rmse = float('inf')
 
-        if np.count_nonzero(high_samples) > 50:
-            ftoh_high_fn = npp.Polynomial.fit(1.0 / freqs[high_samples], heights[high_samples], deg=9)
-        else:
-            self._eddy._log_debug(f"not computing ftoh_high, not enough high samples")
+            # Find optimal polynomial degree
+            for deg in [5, 6, 7, 8, 9]:
+                try:
+                    test_poly = npp.Polynomial.fit(1.0 / freqs, heights, deg=deg)
+                    test_rmse = np_rmse(test_poly, 1.0 / freqs, heights)
+                    if test_rmse < best_rmse:
+                        best_rmse = test_rmse
+                        best_deg = deg
+                except:
+                    continue
+
+            poly_model = npp.Polynomial.fit(1.0 / freqs, heights, deg=best_deg)
+            self._poly_model = poly_model
+            self._use_polynomial = True
+
+            # Still compute the traditional models for compatibility
+            # Use separate fits for low samples for RMSE calculation
+            ftoh_low_fn = npp.Polynomial.fit(1.0 / freqs[low_samples], heights[low_samples], deg=9)
+            htof_low_fn = npp.Polynomial.fit(heights[low_samples], 1.0 / freqs[low_samples], deg=9)
             ftoh_high_fn = None
+
+            # Log with modified name for polynomial mode
+            self._eddy._log_info(f"Using polynomial model (degree {best_deg}) for survey mode, RMSE: {best_rmse:.4f}")
+        else:
+            # Original interpolation-based method
+            ftoh_low_fn = npp.Polynomial.fit(1.0 / freqs[low_samples], heights[low_samples], deg=9)
+            htof_low_fn = npp.Polynomial.fit(heights[low_samples], 1.0 / freqs[low_samples], deg=9)
+
+            if np.count_nonzero(high_samples) > 50:
+                ftoh_high_fn = npp.Polynomial.fit(1.0 / freqs[high_samples], heights[high_samples], deg=9)
+            else:
+                self._eddy._log_debug(f"not computing ftoh_high, not enough high samples")
+                ftoh_high_fn = None
+
+            self._use_polynomial = False
 
         # Calculate rms, only for the low values (where error is most relevant)
         rmse_fth = np_rmse(
@@ -2990,11 +3656,18 @@ class ProbeEddyFrequencyMap:
 
         if report_errors:
             if rmse_fth > 0.050:
-                self._eddy._log_error(
-                    f"Drive current {drive_current} error: calibration error margin is too high ({rmse_fth:.3f}). Possible causes: bad drive current, bad sensor mount height."
-                )
-                if not self._eddy.params.allow_unsafe:
-                    return None, None
+                if use_polynomial:
+                    # For polynomial model, we expect higher RMSE but it's more stable across temperatures
+                    self._eddy._log_warning(
+                        f"Drive current {drive_current}: polynomial model RMSE is {rmse_fth:.3f}. "
+                        f"This is expected for survey mode and provides better temperature stability."
+                    )
+                else:
+                    self._eddy._log_error(
+                        f"Drive current {drive_current} error: calibration error margin is too high ({rmse_fth:.3f}). Possible causes: bad drive current, bad sensor mount height."
+                    )
+                    if not self._eddy.params.allow_unsafe:
+                        return None, None
 
         self._ftoh = ftoh_low_fn
         self._htof = htof_low_fn
@@ -3119,6 +3792,12 @@ class ProbeEddyFrequencyMap:
         if self._ftoh is None:
             raise self._eddy._printer.command_error("Calling freq_to_height on uncalibrated map")
         invfreq = 1.0 / freq
+
+        if self._use_polynomial and self._poly_model is not None:
+            # Use polynomial model for survey mode
+            return float(self._poly_model(invfreq))
+
+        # Original interpolation method
         if self._ftoh_high is not None and invfreq < self._ftoh.domain[0]:
             return float(self._ftoh_high(invfreq))
         return float(self._ftoh(invfreq))
